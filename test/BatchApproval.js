@@ -2,6 +2,7 @@
 
 import utils from '@aztec/dev-utils';
 import Web3 from 'web3';
+import { triggerAsyncId } from 'async_hooks';
 
 const aztec = require('aztec.js');
 const dotenv = require('dotenv');
@@ -11,19 +12,80 @@ const secp256k1 = require('@aztec/secp256k1');
 const ACE = artifacts.require('./ACE.sol');
 
 const ZkAssetMintable = artifacts.require('./ZkAssetMintable.sol');
-const JoinSplit = artifacts.require('@aztec/protocol/contracts/ACE/validators/joinSplit/JoinSplit.sol');
 const BatchApproval = artifacts.require('./BatchApproval.sol');
 
+
+const JoinSplitFluid = artifacts.require('./JoinSplitFluid.sol');
+const Swap = artifacts.require('./Swap.sol');
+const Dividend = artifacts.require('./Dividend.sol');
+const PrivateRange = artifacts.require('./PrivateRange.sol');
+const JoinSplit = artifacts.require('./JoinSplit.sol');
+
 const {
+    constants,
     proofs: {
-        MINT_PROOF,
         JOIN_SPLIT_PROOF,
+        MINT_PROOF,
+        SWAP_PROOF,
+        DIVIDEND_PROOF,
+        BURN_PROOF,
+        PRIVATE_RANGE_PROOF,
     },
 } = utils;
 
 const { JoinSplitProof, MintProof } = aztec;
 
 contract('BatchApproval', async (accounts) => {
+
+    const alice = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_0);
+    const bob   = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_1);
+    const carol = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_2);
+
+    const sum = (arrayToSum) => arrayToSum.reduce((a,b) => a+b, 0);
+
+    const createNotesArray = async (publicKey, values, contractAddress) => {
+        const notes = [];
+        for (let i = 0; i < values.length; i++) {
+            notes[i] = await aztec.note.create(publicKey, values[i], contractAddress);
+        }
+        return notes;
+    };
+    
+    const mintNotes = async (values, ownerPublicKey, fromAddress) => {
+        let notes = await createNotesArray(ownerPublicKey, values, batchApprovalContract.address);
+    
+        const newMintCounterNote = await aztec.note.create(ownerPublicKey, sum(values));
+        const zeroMintCounterNote = await aztec.note.createZeroValueNote();
+        const sender = zkAssetMintableContract.address;
+    
+        const mintProof = new MintProof(
+            zeroMintCounterNote,
+            newMintCounterNote,
+            notes,
+            sender,
+        );
+    
+        const mintData = mintProof.encodeABI();
+        await zkAssetMintableContract.confidentialMint(MINT_PROOF, mintData, {from: fromAddress});
+        const hashes = notes.map(note => note.noteHash);
+        return { notes, values, hashes}
+    };
+    
+    const spendNotes = async (amount, sellerPublicKey, buyerPublicKey, buyerFunds, buyerNotes) => {
+        const invoice = await aztec.note.create(sellerPublicKey, amount);
+        const change = await aztec.note.create(buyerPublicKey, buyerFunds - amount, batchApprovalContract.address);
+        const sendProof = new JoinSplitProof(
+            buyerNotes,
+            [invoice, change],
+            batchApprovalContract.address,
+            0,
+            batchApprovalContract.address,
+        );
+        const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
+        let result = await batchApprovalContract.proofValidation(sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
+        return result;
+    };
+
     const shouldFail = async (codeToRun, expectedError, unwantedSuccessError) => {
         try {
             await codeToRun();
@@ -35,172 +97,100 @@ contract('BatchApproval', async (accounts) => {
         }
     };
 
-    const mintNotesArray = async (publicKey, values, contractAddress) => {
-        const notesArray = [];
-        for (let i = 0; i < values.length; i++) {
-            notesArray[i] = await aztec.note.create(publicKey, values[i], contractAddress);
-        }
-        return notesArray;
-    };
-
-    const sum = (arrayToSum) => arrayToSum.reduce((a,b) => a+b, 0);
-
-    const alice     = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_0);
-    const bob       = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_1);
-    const charlie   = secp256k1.accountFromPrivateKey(process.env.GANACHE_TESTING_ACCOUNT_2);
+    let ace;
     let zkAssetMintableContract;
     let batchApprovalContract;
-
-    let ace;
-    let approvedMintedValues;
-    let approvedMintedNotes;
-    let nonApprovedMintedNotes;
-    let nonApprovedMintedValues;
-    let foreignMintedNotes;
-    let foreignMintedValues;
-    before(async () => {
-        zkAssetMintableContract = await ZkAssetMintable.deployed();
-        batchApprovalContract = await BatchApproval.new(ACE.address, {from: alice.address});
-        ace = await ACE.at(ACE.address);
-
-        approvedMintedValues = [50,75,100];
-        approvedMintedNotes = await mintNotesArray(alice.publicKey, approvedMintedValues, batchApprovalContract.address);
-        nonApprovedMintedValues = [25,125];
-        nonApprovedMintedNotes = await mintNotesArray(alice.publicKey, nonApprovedMintedValues, batchApprovalContract.address);
-        foreignMintedValues = [50,75,100];
-        foreignMintedNotes = await mintNotesArray(alice.publicKey, foreignMintedValues, batchApprovalContract.address);
+    beforeEach(async () => {
+        ace = await ACE.new({from: alice.address,});
+        const aztecJoinSplitFluid = await JoinSplitFluid.new();
+        const aztecJoinSplit = await JoinSplit.new();
+        const aztecSwap = await Swap.new();
+        const aztecDividend = await Dividend.new();
+        await ace.setCommonReferenceString(constants.CRS);
+        await ace.setProof(MINT_PROOF, aztecJoinSplitFluid.address);
+        await ace.setProof(BURN_PROOF, aztecJoinSplitFluid.address);
+        await ace.setProof(JOIN_SPLIT_PROOF, aztecJoinSplit.address);
+        await ace.setProof(SWAP_PROOF, aztecSwap.address);
+        await ace.setProof(DIVIDEND_PROOF, aztecDividend.address);
+        zkAssetMintableContract = await ZkAssetMintable.new(ace.address,
+            '0x0000000000000000000000000000000000000000',
+            1,);
+        batchApprovalContract = await BatchApproval.new(ace.address, {from: alice.address});
     });
 
     it('owner of the contract should be able to mint notes that are owned by the contract', async () => {
-        let allValues = approvedMintedValues.concat(nonApprovedMintedValues).concat(foreignMintedValues);
-        let allNotes = approvedMintedNotes.concat(nonApprovedMintedNotes).concat(foreignMintedNotes);
-
-        const newMintCounterNote = await aztec.note.create(alice.publicKey, sum(allValues));
-        const zeroMintCounterNote = await aztec.note.createZeroValueNote();
-        const sender = zkAssetMintableContract.address;
-
-        const mintProof = new MintProof(
-            zeroMintCounterNote,
-            newMintCounterNote,
-            allNotes,
-            sender,
-        );
-
-        const mintData = mintProof.encodeABI();
-
-        await zkAssetMintableContract.confidentialMint(MINT_PROOF, mintData, {from: alice.address});
-        expect(await ace.getNote(zkAssetMintableContract.address, approvedMintedNotes[0].noteHash)).to.not.equal(undefined);
-        expect(await ace.getNote(zkAssetMintableContract.address, approvedMintedNotes[1].noteHash)).to.not.equal(undefined);
-        expect(await ace.getNote(zkAssetMintableContract.address, approvedMintedNotes[2].noteHash)).to.not.equal(undefined);
-        expect(await ace.getNote(zkAssetMintableContract.address, nonApprovedMintedNotes[0].noteHash)).to.not.equal(undefined);
-        expect(await ace.getNote(zkAssetMintableContract.address, nonApprovedMintedNotes[1].noteHash)).to.not.equal(undefined);
+        const { values, notes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        for (let note of notes) {
+            expect(await ace.getNote(zkAssetMintableContract.address, note.noteHash)).to.not.equal(undefined);
+        }
     });
 
     it('owner of the contract should be able to approve notes that are owned by the contract to be spent by the contract', async () => {
+        const { notes, hashes } = await mintNotes([50,75,100,25,125], alice.publicKey, alice.address);
+        let approvedMintedNotes = [notes[0], notes[1], notes[2]];
+        let nonApprovedMintedNotes = [notes[3], notes[4]];
+
         const noteHashes = approvedMintedNotes.map(note => note.noteHash);
         await batchApprovalContract.batchApprove(noteHashes, zkAssetMintableContract.address, batchApprovalContract.address);
 
-        let note0Approved = await zkAssetMintableContract.confidentialApproved(approvedMintedNotes[0].noteHash, batchApprovalContract.address);
-        let note1Approved = await zkAssetMintableContract.confidentialApproved(approvedMintedNotes[1].noteHash, batchApprovalContract.address);
-        let note2Approved = await zkAssetMintableContract.confidentialApproved(approvedMintedNotes[2].noteHash, batchApprovalContract.address);
-        let note0nonApproved = await zkAssetMintableContract.confidentialApproved(nonApprovedMintedNotes[0].noteHash, batchApprovalContract.address);
-        let note1nonApproved = await zkAssetMintableContract.confidentialApproved(nonApprovedMintedNotes[1].noteHash, batchApprovalContract.address);
-        expect(note0Approved && note1Approved && note2Approved && !note0nonApproved && !note1nonApproved).to.equal(true);
+        for (let note of approvedMintedNotes) {
+            expect(await zkAssetMintableContract.confidentialApproved(note.noteHash, batchApprovalContract.address)).to.equal(true);
+        }
+
+        for (let note of nonApprovedMintedNotes) {
+            expect(await zkAssetMintableContract.confidentialApproved(note.noteHash, batchApprovalContract.address)).to.equal(false);
+        }
     });
 
     it('the contract should be able to spend notes after they have been approved for it to spend', async () => {
-        const invoiceAmount = 100;
-        const invoice = await aztec.note.create(bob.publicKey, invoiceAmount);
-        const change = await aztec.note.create(alice.publicKey, sum(approvedMintedValues) - invoiceAmount, batchApprovalContract.address);
-
-        const sendProof = new JoinSplitProof(
-            approvedMintedNotes,
-            [invoice, change],
-            batchApprovalContract.address,
-            0,
-            batchApprovalContract.address,
-        );
-
-        const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
-        let result = await batchApprovalContract.proofValidation(sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
+        const result = await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         expect(result.receipt.status).to.equal(true);
     });
 
     it('the contract shouldn\'t be able to spend unapproved notes', async() => {
-        const invoiceAmount = 100;
-        const invoice = await aztec.note.create(bob.publicKey, invoiceAmount);
-        const change = await aztec.note.create(alice.publicKey, sum(nonApprovedMintedValues) - invoiceAmount, batchApprovalContract.address);
-        const sendProof = new JoinSplitProof(
-            nonApprovedMintedNotes,
-            [invoice, change],
-            batchApprovalContract.address,
-            0,
-            batchApprovalContract.address,
-        );
-
-        const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
+        const { values, notes } = await mintNotes([25,125], alice.publicKey, alice.address);
         await shouldFail(async () => {
-            await batchApprovalContract.proofValidation(sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
+            await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         }, 'sender does not have approval to spend input note', 'JoinSplit succeeds but notes are not approved');
     });
 
     it('the contract shouldn\'t be able to spend notes that it has already spent', async () => {
-        const invoiceAmount = 100;
-        const invoice = await aztec.note.create(bob.publicKey, invoiceAmount);
-        const change = await aztec.note.create(alice.publicKey, sum(approvedMintedValues) - invoiceAmount, batchApprovalContract.address);
-
-        const sendProof = new JoinSplitProof(
-            approvedMintedNotes,
-            [invoice, change],
-            batchApprovalContract.address,
-            0,
-            batchApprovalContract.address,
-        );
-
-        const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey,  alice.address);
+        await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
+        await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
-            await batchApprovalContract.proofValidation(sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
+            await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         }, 'input note status is not UNSPENT', 'JoinSplit succeeds but notes should already be spent');
     });
 
     it('owner of the contract should be able to approve notes for spending by another person', async () => {
-        const noteHashes = foreignMintedNotes.map(note => note.noteHash);
-        await batchApprovalContract.batchApprove(noteHashes, zkAssetMintableContract.address, bob.address);
-
-        let note0Approved = await zkAssetMintableContract.confidentialApproved(foreignMintedNotes[0].noteHash, bob.address);
-        let note1Approved = await zkAssetMintableContract.confidentialApproved(foreignMintedNotes[1].noteHash, bob.address);
-        let note2Approved = await zkAssetMintableContract.confidentialApproved(foreignMintedNotes[2].noteHash, bob.address);
-        expect(note0Approved && note1Approved && note2Approved).to.equal(true);
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, bob.address);
+        for (let note of notes) {
+            expect(await zkAssetMintableContract.confidentialApproved(note.noteHash, bob.address)).to.equal(true);
+        }
     });
 
     // it('another person should be able to spend notes owned by the contract after they have been approved for them to spend', async () => {
-    //     const invoice = await aztec.note.create(charlie.publicKey, 100);
-    //     const change = await aztec.note.create(bob.publicKey, 125, batchApprovalContract.address);
-
-    //     const sendProof = new JoinSplitProof(
-    //         foreignMintedNotes,
-    //         [invoice, change],
-    //         batchApprovalContract.address,
-    //         0,
-    //         batchApprovalContract.address,
-    //     );
-
-    //     const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
-    //     let result = await batchApprovalContract.proofValidation(sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
-    //     expect(result.receipt.status).to.equal(true);
     // });
 
     it('the contract shouldn\'t be able to approve notes for itself to spend that have already been spent', async () => {
-        const noteHashes = approvedMintedNotes.map(note => note.noteHash);
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
+        const result = await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
-            await batchApprovalContract.batchApprove(noteHashes, zkAssetMintableContract.address, batchApprovalContract.address);
+            await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
         }, 'only unspent notes can be approved', 'approval for this address succeeds but notes should already be spent so it should be impossible to approve them');
     });
 
     it('the contract shouldn\'t be able to approve notes for another address to spend that have already been spent', async () => {
-        const noteHashes = approvedMintedNotes.map(note => note.noteHash);
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
+        await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
-            await batchApprovalContract.batchApprove(noteHashes, zkAssetMintableContract.address, bob.address);
+            await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, bob.address);
         }, 'only unspent notes can be approved', 'approval for another address succeeds but notes should already be spent so it should be impossible to approve them');
     });
 });
