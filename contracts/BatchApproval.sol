@@ -43,8 +43,7 @@ contract BatchApproval is Ownable, IAZTEC {
      * @author AZTEC
      * @param _noteHashes An array of hashes of notes (that must be owned by this contract) to to be approved for spending
      * @param _zkAsset The address of the zkAsset that minted these notes
-     * @param _spender The address of the person or contract that is being approved to spend these notes.
-     *                 Can be any person or contract e.g. Bob, a different third-party, a contract, this contract itself.
+     * @param _spender The address of the person or contract that is being approved to spend these notes. Can be any person or contract e.g. Bob, a different third-party, a contract, this contract itself.
      */
     function batchApprove(bytes32[] memory _noteHashes, address _zkAsset, address _spender) public onlyOwner notesOwned(_noteHashes, _zkAsset) {
         IZkAsset asset = IZkAsset(_zkAsset);
@@ -58,10 +57,24 @@ contract BatchApproval is Ownable, IAZTEC {
      * @author AZTEC
      * @param _proof The proof data to verify
      * @param _zkAsset The address of the zkAsset
+     * @param _sender The address sending the proof
      */
     function proofValidation(bytes memory _proof, address _zkAsset, address _sender) public onlyOwner {
         IZkAsset asset = IZkAsset(_zkAsset);
         (bytes memory _proofOutputs) = ACE(aceAddress).validateProof(JOIN_SPLIT_PROOF, _sender, _proof);
         asset.confidentialTransferFrom(JOIN_SPLIT_PROOF, _proofOutputs.get(0));
+    }
+
+    /**
+     * @notice Approves notes and validates a Join-Split proof to transfer notes to another addresstwo
+     * @author AZTEC
+     * @param _noteHashes An array of hashes of notes (that must be owned by this contract) to to be approved for spending
+     * @param _proof The proof data to verify
+     * @param _zkAsset The address of the zkAsset
+     * @param _senderSpender The address sending the proof
+     */
+    function spendNotes(bytes32[] memory _noteHashes, bytes memory _proof, address _zkAsset, address _spenderSender) public onlyOwner {
+        batchApprove(_noteHashes, _zkAsset, _spenderSender);
+        proofValidation(_proof, _zkAsset, _spenderSender);
     }
 }

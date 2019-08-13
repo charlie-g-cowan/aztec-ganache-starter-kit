@@ -68,10 +68,25 @@ contract('BatchApproval', async (accounts) => {
         const mintData = mintProof.encodeABI();
         await zkAssetMintableContract.confidentialMint(MINT_PROOF, mintData, {from: fromAddress});
         const hashes = notes.map(note => note.noteHash);
-        return { notes, values, hashes}
+        return { notes, values, hashes };
+    };
+
+    const approveAndSpendNotes = async (amount, sellerPublicKey, buyerPublicKey, buyerFunds, buyerNotes, buyerNoteHashes) => {
+        const invoice = await aztec.note.create(sellerPublicKey, amount);
+        const change = await aztec.note.create(buyerPublicKey, buyerFunds - amount, batchApprovalContract.address);
+        const sendProof = new JoinSplitProof(
+            buyerNotes,
+            [invoice, change],
+            batchApprovalContract.address,
+            0,
+            batchApprovalContract.address,
+        );
+        const sendProofData = sendProof.encodeABI(zkAssetMintableContract.address);
+        let result = await batchApprovalContract.spendNotes(buyerNoteHashes, sendProofData, zkAssetMintableContract.address, batchApprovalContract.address);
+        return result;
     };
     
-    const spendNotes = async (amount, sellerPublicKey, buyerPublicKey, buyerFunds, buyerNotes) => {
+    const spendNotesWithFunctions = async (amount, sellerPublicKey, buyerPublicKey, buyerFunds, buyerNotes) => {
         const invoice = await aztec.note.create(sellerPublicKey, amount);
         const change = await aztec.note.create(buyerPublicKey, buyerFunds - amount, batchApprovalContract.address);
         const sendProof = new JoinSplitProof(
@@ -145,23 +160,29 @@ contract('BatchApproval', async (accounts) => {
     it('the contract should be able to spend notes after they have been approved for it to spend', async () => {
         const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
         await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
-        const result = await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+        const result = await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
+        expect(result.receipt.status).to.equal(true);
+    });
+
+    it('the contract should be able to approve and spend notes in one call using the spendNotes method', async () => {
+        const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
+        const result = await approveAndSpendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes, hashes);
         expect(result.receipt.status).to.equal(true);
     });
 
     it('the contract shouldn\'t be able to spend unapproved notes', async() => {
         const { values, notes } = await mintNotes([25,125], alice.publicKey, alice.address);
         await shouldFail(async () => {
-            await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+            await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
         }, 'sender does not have approval to spend input note', 'JoinSplit succeeds but notes are not approved');
     });
 
     it('the contract shouldn\'t be able to spend notes that it has already spent', async () => {
         const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey,  alice.address);
         await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
-        await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+        await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
-            await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+            await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
         }, 'input note status is not UNSPENT', 'JoinSplit succeeds but notes should already be spent');
     });
 
@@ -173,13 +194,10 @@ contract('BatchApproval', async (accounts) => {
         }
     });
 
-    // it('another person should be able to spend notes owned by the contract after they have been approved for them to spend', async () => {
-    // });
-
     it('the contract shouldn\'t be able to approve notes for itself to spend that have already been spent', async () => {
         const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
         await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
-        const result = await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+        const result = await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
             await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
         }, 'only unspent notes can be approved', 'approval for this address succeeds but notes should already be spent so it should be impossible to approve them');
@@ -188,9 +206,13 @@ contract('BatchApproval', async (accounts) => {
     it('the contract shouldn\'t be able to approve notes for another address to spend that have already been spent', async () => {
         const { values, notes, hashes } = await mintNotes([50,75,100], alice.publicKey, alice.address);
         await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, batchApprovalContract.address);
-        await spendNotes(100, bob.publicKey, alice.publicKey, sum(values), notes);
+        await spendNotesWithFunctions(100, bob.publicKey, alice.publicKey, sum(values), notes);
         await shouldFail(async () => {
             await batchApprovalContract.batchApprove(hashes, zkAssetMintableContract.address, bob.address);
         }, 'only unspent notes can be approved', 'approval for another address succeeds but notes should already be spent so it should be impossible to approve them');
     });
+
+    // it('another person should be able to spend notes owned by the contract after they have been approved for them to spend', async () => {
+
+    // });
 });
